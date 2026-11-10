@@ -1,0 +1,179 @@
+// aiApply - AI_Drafts button function ("AI Reflect").
+// The ONLY function that writes AI results into Leads, and only for drafts whose
+// content still matches their Approved_Snapshot. Email drafts are refused.
+string button.aiApply(String draftId)
+{
+	// function_name: aiApply (AI Drafts button "AI反映")
+	// The only function allowed to write AI results into Leads, and only
+	// the whitelist fields (AI_Summary / AI_Summary_At / AI_Category /
+	// AI_Category_At). Email drafts are never applied (Approved is final).
+	// Checks, in order: status is Approved; the lead fingerprint still
+	// matches; the current outputs still match Approved_Snapshot; then a
+	// conditional update (If-Unmodified-Since) with read-back verify.
+	draftIdNum = draftId.toLong();
+	draft = zoho.crm.getRecordById("AI_Drafts", draftIdNum);
+	if(draft == null)
+	{
+		return "下書きが見つかりませんでした。";
+	}
+	st = draft.get("Status");
+	if(st == "Applied")
+	{
+		return "この下書きは反映済みです。";
+	}
+	if(st == "Applying")
+	{
+		return "この下書きは反映処理中です。";
+	}
+	if(st != "Approved")
+	{
+		return "反映できるのは Approved の下書きだけです（現在: " + ifnull(st, "") + "）。";
+	}
+	dtype = ifnull(draft.get("Draft_Type"), "");
+	if(dtype == "Email")
+	{
+		return "メール下書きは反映対象外です（承認が終端で、送信もしません）。";
+	}
+	tl = draft.get("Target_Lead");
+	if(tl == null || tl.get("id") == null)
+	{
+		return "対象リードが記録されていません。";
+	}
+	leadIdNum = tl.get("id").toLong();
+	leadId = tl.get("id").toString();
+	lead = zoho.crm.getRecordById("Leads", leadIdNum);
+	if(lead == null)
+	{
+		return "対象リードが見つかりませんでした。";
+	}
+	// ---- Freshness: fingerprint must still match ----
+	leadMT = ifnull(lead.get("Modified_Time"), "");
+	notes = zoho.crm.getRelatedRecords("Notes", "Leads", leadIdNum, 1, 50);
+	fpNotes = "";
+	if(notes != null)
+	{
+		for each n in notes
+		{
+			fpNotes = fpNotes + n.get("id").toString() + "@" + ifnull(n.get("Modified_Time"), "") + ",";
+		}
+	}
+	fpNow = "[FP] LMT=" + leadMT + ";N=" + fpNotes;
+	snapStored = ifnull(draft.get("Input_Snapshot"), "");
+	if(snapStored.contains(fpNow) == false)
+	{
+		staleUpd = Map();
+		staleUpd.put("Status", "Stale");
+		zoho.crm.updateRecord("AI_Drafts", draftIdNum, staleUpd);
+		return "生成後にリードまたはノートが変更されているため、この下書きは Stale（失効）にしました。再生成してください。";
+	}
+	// ---- Integrity: outputs must equal the approved snapshot ----
+	genVal = draft.get("Generation");
+	genStr = "";
+	if(genVal != null)
+	{
+		genStr = genVal.toString();
+	}
+	rebuilt = "type=" + dtype + "|lead=" + leadId + "|gen=" + genStr;
+	if(dtype == "Classification")
+	{
+		rebuilt = rebuilt + "|cat=" + ifnull(draft.get("AI_Category"), "") + "|conf=" + ifnull(draft.get("AI_Confidence"), "") + "|reason=" + ifnull(draft.get("AI_Reason"), "");
+	}
+	if(dtype == "Summary")
+	{
+		rebuilt = rebuilt + "|summary=" + ifnull(draft.get("AI_Output_Summary"), "");
+	}
+	storedSnap = ifnull(draft.get("Approved_Snapshot"), "");
+	if(rebuilt != storedSnap)
+	{
+		staleUpd = Map();
+		staleUpd.put("Status", "Stale");
+		zoho.crm.updateRecord("AI_Drafts", draftIdNum, staleUpd);
+		return "承認後に下書きの内容が変更されているため Stale（失効）にしました。再生成からやり直してください。";
+	}
+	// ---- Mark Applying (exclusion), then conditional update ----
+	nowJST = zoho.currenttime.addHour(17);
+	nowStr = nowJST.toString("yyyy-MM-dd'T'HH:mm:ssXXX");
+	applyingUpd = Map();
+	applyingUpd.put("Status", "Applying");
+	zoho.crm.updateRecord("AI_Drafts", draftIdNum, applyingUpd);
+	recMap = Map();
+	recMap.put("id", leadIdNum);
+	if(dtype == "Classification")
+	{
+		recMap.put("AI_Category", draft.get("AI_Category"));
+		recMap.put("AI_Category_At", nowStr);
+	}
+	if(dtype == "Summary")
+	{
+		recMap.put("AI_Summary", draft.get("AI_Output_Summary"));
+		recMap.put("AI_Summary_At", nowStr);
+	}
+	dataList = List();
+	dataList.add(recMap);
+	bodyMap = Map();
+	bodyMap.put("data", dataList);
+	bodyMap.put("trigger", List());
+	sourceMT = "";
+	if(draft.get("Source_Modified_Time") != null)
+	{
+		sourceMT = draft.get("Source_Modified_Time").toString();
+	}
+	hdrMap = Map();
+	if(sourceMT != "")
+	{
+		hdrMap.put("If-Unmodified-Since", sourceMT);
+	}
+	resp = invokeurl
+	[
+		url :"https://www.zohoapis.com/crm/v8/Leads/" + leadId
+		type :PUT
+		parameters: bodyMap.toString()
+		headers:hdrMap
+		connection:"your_crm_connection"
+	];
+	respText = "";
+	if(resp != null)
+	{
+		respText = resp.toString();
+	}
+	info "applyResp=" + respText;
+	// ---- Read back and converge ----
+	leadAfter = zoho.crm.getRecordById("Leads", leadIdNum);
+	appliedOk = false;
+	if(leadAfter != null)
+	{
+		if(dtype == "Classification" && leadAfter.get("AI_Category") != null && leadAfter.get("AI_Category").toString() == draft.get("AI_Category").toString())
+		{
+			appliedOk = true;
+		}
+		if(dtype == "Summary" && leadAfter.get("AI_Summary") != null && leadAfter.get("AI_Summary").toString() == draft.get("AI_Output_Summary").toString())
+		{
+			appliedOk = true;
+		}
+	}
+	if(appliedOk)
+	{
+		doneUpd = Map();
+		doneUpd.put("Status", "Applied");
+		doneUpd.put("Applied_At", nowStr);
+		zoho.crm.updateRecord("AI_Drafts", draftIdNum, doneUpd);
+		return "Leads へ反映しました（読み戻しで確認済み）。";
+	}
+	if(respText.contains("ALREADY_MODIFIED"))
+	{
+		staleUpd = Map();
+		staleUpd.put("Status", "Stale");
+		zoho.crm.updateRecord("AI_Drafts", draftIdNum, staleUpd);
+		return "リードが先に更新されていたため反映を中止し、Stale（失効）にしました。";
+	}
+	backUpd = Map();
+	backUpd.put("Status", "Approved");
+	errText = "Apply failed. resp=" + respText;
+	if(errText.length() > 1900)
+	{
+		errText = errText.subString(0, 1900);
+	}
+	backUpd.put("Error_Detail", errText);
+	zoho.crm.updateRecord("AI_Drafts", draftIdNum, backUpd);
+	return "反映できませんでした。下書きは Approved に戻しました。Error Detail を確認してください。";
+}

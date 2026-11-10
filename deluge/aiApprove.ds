@@ -1,0 +1,80 @@
+// aiApprove - AI_Drafts button function ("AI Approve").
+// Rebuilds the input fingerprint and freezes an Approved_Snapshot.
+// If the lead or its notes changed after generation, the draft becomes Stale.
+string button.aiApprove(String draftId)
+{
+	// function_name: aiApprove (AI Drafts button "AI承認")
+	// Approves a Generated draft only after re-checking freshness:
+	// the fingerprint rebuilt from the current lead + notes must equal
+	// the [FP] line stored in Input_Snapshot at generation time.
+	// On success the approved output is frozen into Approved_Snapshot.
+	draftIdNum = draftId.toLong();
+	draft = zoho.crm.getRecordById("AI_Drafts", draftIdNum);
+	if(draft == null)
+	{
+		return "下書きが見つかりませんでした。";
+	}
+	st = draft.get("Status");
+	if(st != "Generated")
+	{
+		return "承認できるのは Generated の下書きだけです（現在: " + ifnull(st, "") + "）。";
+	}
+	tl = draft.get("Target_Lead");
+	if(tl == null || tl.get("id") == null)
+	{
+		return "対象リードが記録されていません。";
+	}
+	leadIdNum = tl.get("id").toLong();
+	leadId = tl.get("id").toString();
+	lead = zoho.crm.getRecordById("Leads", leadIdNum);
+	if(lead == null)
+	{
+		return "対象リードが見つかりませんでした。";
+	}
+	// ---- Rebuild fingerprint (same construction as generation) ----
+	leadMT = ifnull(lead.get("Modified_Time"), "");
+	notes = zoho.crm.getRelatedRecords("Notes", "Leads", leadIdNum, 1, 50);
+	fpNotes = "";
+	if(notes != null)
+	{
+		for each n in notes
+		{
+			fpNotes = fpNotes + n.get("id").toString() + "@" + ifnull(n.get("Modified_Time"), "") + ",";
+		}
+	}
+	fpNow = "[FP] LMT=" + leadMT + ";N=" + fpNotes;
+	snapStored = ifnull(draft.get("Input_Snapshot"), "");
+	if(snapStored.contains(fpNow) == false)
+	{
+		staleUpd = Map();
+		staleUpd.put("Status", "Stale");
+		zoho.crm.updateRecord("AI_Drafts", draftIdNum, staleUpd);
+		return "生成後にリードまたはノートが変更されているため、この下書きは Stale（失効）にしました。再生成してください。";
+	}
+	// ---- Freeze the approved output ----
+	dtype = ifnull(draft.get("Draft_Type"), "");
+	genVal = draft.get("Generation");
+	genStr = "";
+	if(genVal != null)
+	{
+		genStr = genVal.toString();
+	}
+	approvedSnap = "type=" + dtype + "|lead=" + leadId + "|gen=" + genStr;
+	if(dtype == "Classification")
+	{
+		approvedSnap = approvedSnap + "|cat=" + ifnull(draft.get("AI_Category"), "") + "|conf=" + ifnull(draft.get("AI_Confidence"), "") + "|reason=" + ifnull(draft.get("AI_Reason"), "");
+	}
+	if(dtype == "Summary")
+	{
+		approvedSnap = approvedSnap + "|summary=" + ifnull(draft.get("AI_Output_Summary"), "");
+	}
+	if(dtype == "Email")
+	{
+		approvedSnap = approvedSnap + "|subject=" + ifnull(draft.get("Email_Subject"), "") + "|body=" + ifnull(draft.get("Email_Body"), "");
+	}
+	upd = Map();
+	upd.put("Status", "Approved");
+	upd.put("Approved_Snapshot", approvedSnap);
+	zoho.crm.updateRecord("AI_Drafts", draftIdNum, upd);
+	return "承認しました。この内容で固定され、反映ボタンから Leads へ反映できます。";
+}
